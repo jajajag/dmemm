@@ -11,7 +11,7 @@ import diffuser.utils as utils
 # -----------------------------------------------------------------------------#
 
 class Parser(utils.Parser):
-    # 默认 walker2d，你可以改成 halfcheetah-medium-expert-v2 等
+    # 默认 walker2d，按需改成 halfcheetah 等
     dataset: str = 'walker2d-medium-replay-v2'
     config: str = 'config.locomotion'
 
@@ -140,11 +140,11 @@ print("[Info] Initial obs shape:", obs0.shape)
 print("[Info] diffusion horizon:", diffusion.horizon)
 
 H = diffusion.horizon      # e.g., 4
-T_MAX = 32                 # env 交互最多步数（两条 rollout 都用这个上限）
+T_MAX = 32                 # 想 env / model rollout 到多少步（上限）
 
 
 # -----------------------------------------------------------------------------#
-# 1) Rollout plan1: 每 1 步 replan（MPC-style）                                  #
+# 1) plan1: 每 1 步 replan（MPC-style，真实 env）                                #
 # -----------------------------------------------------------------------------#
 
 restore_env_state(env, init_state)
@@ -171,7 +171,7 @@ print("[Info] plan1 rollout length (env steps):", len(states_plan1) - 1)
 
 
 # -----------------------------------------------------------------------------#
-# 2) Rollout planH: 每 H 步 replan，一次执行完整 horizon 计划                   #
+# 2) planH: 每 H 步 replan（执行完整 horizon，真实 env）                         #
 # -----------------------------------------------------------------------------#
 
 restore_env_state(env, init_state)
@@ -208,32 +208,77 @@ print("[Info] planH rollout length (env steps):", len(states_planH) - 1)
 
 
 # -----------------------------------------------------------------------------#
-# 3) Direct plan: 纯 diffusion 预测 obs（open-loop），不与 env 交互               #
+# 3) dir1: 每 1 步 replan，但只在 model 里滚（不 step env）                      #
+#    每次只用预测 obs 的第 0 步，接上去继续 plan                                 #
 # -----------------------------------------------------------------------------#
 
-print("\n[direct] sampling open-loop plan from initial obs...")
-conditions0 = {0: obs0}
-_, samples0 = policy(conditions0, batch_size=1, verbose=False)
+print("\n[dir1] model-only rollout with step-wise replan...")
+obs_d1 = obs0.copy()
+ref_state_d1 = init_state.copy()
 
-if not hasattr(samples0, "observations"):
-    raise RuntimeError("samples0 没有 observations 字段？")
+direct1_states = [init_state.copy()]
 
-plan_obs = samples0.observations[0]   # [H, obs_dim]
-print("[Info] direct-plan predicted obs shape:", plan_obs.shape)
+for t in range(T_MAX):
+    conditions = {0: obs_d1}
+    _, samples_d1 = policy(conditions, batch_size=1, verbose=False)
 
-direct_states = []
-for i in range(len(plan_obs)):
-    st = obs_to_state(env, plan_obs[i], ref_state=init_state)
-    direct_states.append(st)
-direct_states = np.stack(direct_states, axis=0)
-print("[Info] direct-plan state length:", len(direct_states))
+    if not hasattr(samples_d1, "observations"):
+        raise RuntimeError("samples_d1 没有 observations 字段？")
+
+    traj = samples_d1.observations[0]   # [H, obs_dim]
+    next_obs = traj[0]                  # 只拿第一步的 obs
+
+    st = obs_to_state(env, next_obs, ref_state=ref_state_d1)
+    direct1_states.append(st)
+
+    # 下一个 step 的条件
+    ref_state_d1 = st
+    obs_d1 = next_obs
+
+direct1_states = np.stack(direct1_states, axis=0)
+print("[Info] dir1 (model-only) length:", len(direct1_states) - 1)
+
+
+# -----------------------------------------------------------------------------#
+# 4) dirH: 每 H 步 replan，model-only，多段 horizon obs 接起来直到 T_MAX        #
+# -----------------------------------------------------------------------------#
+
+print("\n[dirH] model-only rollout with H-step segments...")
+obs_dH = obs0.copy()
+ref_state_dH = init_state.copy()
+
+directH_states = [init_state.copy()]
+steps = 0
+
+while steps < T_MAX:
+    conditions = {0: obs_dH}
+    _, samples_dH = policy(conditions, batch_size=1, verbose=False)
+
+    if not hasattr(samples_dH, "observations"):
+        raise RuntimeError("samples_dH 没有 observations 字段？")
+
+    traj = samples_dH.observations[0]   # [H, obs_dim]
+
+    for k in range(H):
+        if steps >= T_MAX:
+            break
+        next_obs = traj[k]
+        st = obs_to_state(env, next_obs, ref_state=ref_state_dH)
+        directH_states.append(st)
+
+        ref_state_dH = st
+        obs_dH = next_obs
+        steps += 1
+
+directH_states = np.stack(directH_states, axis=0)
+print("[Info] dirH (model-only) length:", len(directH_states) - 1)
 
 
 # -----------------------------------------------------------------------------#
 #                             Rendering to images                               #
 # -----------------------------------------------------------------------------#
 
-# 保存目录：短一点，就叫 traj_vis
+# 保存目录：短名字 traj_vis
 if args.savepath is None:
     base_save = os.path.join(args.loadbase, args.dataset)
     if args.diffusion_loadpath is not None:
@@ -244,20 +289,23 @@ else:
 
 dir_plan1 = os.path.join(save_root, "plan1")
 dir_planH = os.path.join(save_root, "planH")
-dir_direct = os.path.join(save_root, "direct")
+dir_dir1 = os.path.join(save_root, "dir1")
+dir_dirH = os.path.join(save_root, "dirH")
 
 os.makedirs(dir_plan1, exist_ok=True)
 os.makedirs(dir_planH, exist_ok=True)
-os.makedirs(dir_direct, exist_ok=True)
+os.makedirs(dir_dir1, exist_ok=True)
+os.makedirs(dir_dirH, exist_ok=True)
 
-print(f"[Saving] plan1  -> {dir_plan1}")
-print(f"[Saving] planH  -> {dir_planH}")
-print(f"[Saving] direct -> {dir_direct}")
+print(f"[Saving] plan1 -> {dir_plan1}")
+print(f"[Saving] planH -> {dir_planH}")
+print(f"[Saving] dir1  -> {dir_dir1}")
+print(f"[Saving] dirH  -> {dir_dirH}")
 
 
 def render_state_sequence(states, out_dir, prefix):
     """
-    states: [N, nq+nv] 或 [N, ...]，逐帧渲成 png.
+    states: [N, nq+nv]，逐帧渲成 png.
     """
     for i, st in enumerate(states):
         img = renderer.render(st)
@@ -267,7 +315,8 @@ def render_state_sequence(states, out_dir, prefix):
 
 render_state_sequence(states_plan1, dir_plan1, prefix="p1")
 render_state_sequence(states_planH, dir_planH, prefix="pH")
-render_state_sequence(direct_states, dir_direct, prefix="pd")
+render_state_sequence(direct1_states, dir_dir1, prefix="d1")
+render_state_sequence(directH_states, dir_dirH, prefix="dH")
 
 print("[Done] All frames saved.")
 
