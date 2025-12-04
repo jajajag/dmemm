@@ -11,62 +11,48 @@ import diffuser.utils as utils
 # -----------------------------------------------------------------------------#
 
 class Parser(utils.Parser):
-    dataset: str = 'halfcheetah-medium-expert-v2'   # 按需要改
+    dataset: str = 'halfcheetah-medium-expert-v2'   # 按需改
     config: str = 'config.locomotion'
 
 args = Parser().parse_args('plan')
 
 
 # -----------------------------------------------------------------------------#
-#                              Helper: unwrap env                               #
+#                          helpers: unwrap & restore env                        #
 # -----------------------------------------------------------------------------#
 
 def unwrap_env(env):
-    """把 NormalizedEnv / TimeLimit 这一类 wrapper 一层层拆掉，拿到最底层 MujocoEnv."""
+    """把 NormalizedEnv / TimeLimit 等 wrapper 一层层拆掉，拿到底层 MujocoEnv。"""
     e = env
     while hasattr(e, 'env'):
         e = e.env
     return e
 
 
-def obs_to_state(env, obs, ref_state=None):
+def restore_env_state(env, state):
     """
-    将 gym Mujoco 的 observation 转回 state = [qpos, qvel].
-    对于 halfcheetah / walker2d 这一类，obs = [qpos[1:], qvel].
-
-    参数:
-        env: dataset.env
-        obs: (obs_dim,) 例如 17 维
-        ref_state: (nq+nv,) 用来提供 root x（qpos[0]）；如果为 None，就用当前 env.state_vector().
+    把环境恢复到给定 MUJOCO state（qpos+qvel），并且把 wrapper 的 _elapsed_steps 归零。
+    state: shape (nq + nv,)
     """
     base_env = unwrap_env(env)
     model = base_env.model
     nq = model.nq
     nv = model.nv
 
-    obs = np.asarray(obs)
-    assert obs.shape[-1] == (nq - 1 + nv), \
-        f"Unexpected obs dim {obs.shape[-1]}, expected {nq-1+nv} for nq={nq}, nv={nv}"
+    qpos = state[:nq]
+    qvel = state[nq:]
 
-    if ref_state is None:
-        ref_state = base_env.state_vector()
-    ref_state = np.asarray(ref_state)
-    assert ref_state.shape[-1] == nq + nv
+    base_env.set_state(qpos, qvel)
 
-    ref_qpos = ref_state[:nq]
-    # root x 用 ref_qpos[0]，使得画出来的位置大致合理
-    root_x = ref_qpos[0]
-
-    qpos = np.zeros(nq, dtype=np.float32)
-    qvel = np.zeros(nv, dtype=np.float32)
-
-    # obs = [qpos[1:], qvel]
-    qpos[0] = root_x
-    qpos[1:] = obs[:nq-1]
-    qvel[:] = obs[nq-1:]
-
-    state = np.concatenate([qpos, qvel], axis=0)
-    return state
+    # 把外面 TimeLimit 等 wrapper 的步骤计数也重置一下
+    e = env
+    while True:
+        if hasattr(e, "_elapsed_steps"):
+            e._elapsed_steps = 0
+        if hasattr(e, "env"):
+            e = e.env
+        else:
+            break
 
 
 # -----------------------------------------------------------------------------#
@@ -112,89 +98,110 @@ env = dataset.env
 base_env = unwrap_env(env)
 
 # -----------------------------------------------------------------------------#
-#                        1) Open-loop: 单次 plan 的 trajectory                  #
+#                         Reset once, get initial state                         #
 # -----------------------------------------------------------------------------#
 
-obs = env.reset()
+obs0 = env.reset()
 init_state = base_env.state_vector().copy()
 
-horizon = diffusion.horizon    # diffusion 模型的预测长度
-print(f"[Info] diffusion horizon = {horizon}")
+print("[Info] Initial obs shape:", obs0.shape)
+print("[Info] diffusion horizon:", diffusion.horizon)
 
-conditions = {0: obs}
-action0, samples0 = policy(conditions, batch_size=1, verbose=args.verbose)
-# samples0.observations: 形状 [1, horizon, obs_dim]
-plan_obs_traj = samples0.observations[0]      # [H, obs_dim]
+horizon = diffusion.horizon
 
-print(f"[Info] Got open-loop plan observations with shape {plan_obs_traj.shape}")
 
-# 把 plan 的 obs 转成 state，基于初始 state 的 root x
-plan_states = []
+# -----------------------------------------------------------------------------#
+#                  1) Fixed-plan rollout: 执行第一次 plan 的整条 action         #
+# -----------------------------------------------------------------------------#
+
+# 从初始 obs0 sample 一条 plan
+conditions0 = {0: obs0}
+action0, samples0 = policy(conditions0, batch_size=1, verbose=args.verbose)
+
+if not hasattr(samples0, "actions"):
+    raise RuntimeError("samples0 没有 actions 字段，policy 没有返回整条 action 计划？")
+
+plan_actions = samples0.actions[0]   # shape: [H, act_dim]
+print("[Info] Got fixed plan actions with shape:", plan_actions.shape)
+
+# 确保从 init_state 开始
+restore_env_state(env, init_state)
+obs = obs0.copy()
+
+fixed_states = [base_env.state_vector().copy()]
+
 for t in range(horizon):
-    st = obs_to_state(env, plan_obs_traj[t], ref_state=init_state)
-    plan_states.append(st)
-plan_states = np.stack(plan_states, axis=0)   # [H, nq+nv]
+    a = plan_actions[t]
+    obs, r, done, info = env.step(a)
+    fixed_states.append(base_env.state_vector().copy())
+
+    if done:
+        print(f"[Fixed-plan] episode done at t={t}")
+        break
+
+fixed_states = np.stack(fixed_states, axis=0)
+print("[Info] Fixed-plan rollout length:", len(fixed_states))
 
 
 # -----------------------------------------------------------------------------#
-#                       2) Closed-loop: 每步重新 plan 的 rollout               #
+#              2) Replan rollout: 每一步都重新 plan，只执行第一步 action       #
 # -----------------------------------------------------------------------------#
 
-closed_states = [init_state.copy()]
-closed_obs = [obs.copy()]
+restore_env_state(env, init_state)
+obs = obs0.copy()
 
-max_steps = horizon    # 你也可以设成其他，比如 200
+replan_states = [base_env.state_vector().copy()]
+
+max_steps = horizon  # 为了公平起见也跑 horizon 步，你也可以单独设一个更大的 T
 
 for t in range(max_steps):
     if t % 10 == 0:
-        print(f"[Closed-loop] t = {t}", flush=True)
+        print(f"[Replan] t={t}", flush=True)
 
     conditions = {0: obs}
-    action, samples_t = policy(conditions, batch_size=1, verbose=False)
+    action_t, samples_t = policy(conditions, batch_size=1, verbose=False)
 
-    next_obs, reward, done, _ = env.step(action)
+    obs, r, done, info = env.step(action_t)
+    replan_states.append(base_env.state_vector().copy())
 
-    closed_obs.append(next_obs.copy())
-    closed_states.append(base_env.state_vector().copy())
-
-    obs = next_obs
     if done:
-        print(f"[Closed-loop] Episode done at t = {t}")
+        print(f"[Replan] episode done at t={t}")
         break
 
-closed_states = np.stack(closed_states, axis=0)   # [T_cl+1, nq+nv]
-print(f"[Info] Closed-loop rollout length = {len(closed_states)}")
+replan_states = np.stack(replan_states, axis=0)
+print("[Info] Replan rollout length:", len(replan_states))
 
 
 # -----------------------------------------------------------------------------#
-#                               Rendering to images                             #
+#                             Rendering to images                               #
 # -----------------------------------------------------------------------------#
 
-save_root = os.path.join(args.savepath, "two_traj_images")
-open_dir = os.path.join(save_root, "open_loop_plan")
-closed_dir = os.path.join(save_root, "closed_loop")
-os.makedirs(open_dir, exist_ok=True)
-os.makedirs(closed_dir, exist_ok=True)
+if args.savepath is None:
+    save_root = os.path.join(args.loadbase, args.dataset, "two_rollout_images")
+else:
+    save_root = os.path.join(args.savepath, "two_rollout_images")
 
-print(f"[Saving] Open-loop images -> {open_dir}")
-print(f"[Saving] Closed-loop images -> {closed_dir}")
+fixed_dir = os.path.join(save_root, "fixed_plan")
+replan_dir = os.path.join(save_root, "replan")
+os.makedirs(fixed_dir, exist_ok=True)
+os.makedirs(replan_dir, exist_ok=True)
+
+print(f"[Saving] Fixed-plan images -> {fixed_dir}")
+print(f"[Saving] Replan images     -> {replan_dir}")
 
 
-def render_state_sequence(states, out_dir, prefix="traj"):
+def render_state_sequence(states, out_dir, prefix):
     """
     给定一串 MUJOCO state（qpos+qvel），逐帧用 renderer.render() 存成 png.
     """
     for i, st in enumerate(states):
-        img = renderer.render(st)     # 这里传 state（长度 nq+nv），就不会再报 18 vs 17 的错了
+        img = renderer.render(st)   # 这里传的是完整 state，不是 obs
         fname = os.path.join(out_dir, f"{prefix}_{i:04d}.png")
         imageio.imwrite(fname, img)
 
 
-# 1) 渲染 open-loop 计划出来的 trajectory
-render_state_sequence(plan_states, open_dir, prefix="open")
-
-# 2) 渲染 closed-loop rollout 的真实轨迹
-render_state_sequence(closed_states, closed_dir, prefix="closed")
+render_state_sequence(fixed_states, fixed_dir, prefix="fixed")
+render_state_sequence(replan_states, replan_dir, prefix="replan")
 
 print("[Done] All frames saved.")
 
