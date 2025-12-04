@@ -11,7 +11,7 @@ import diffuser.utils as utils
 # -----------------------------------------------------------------------------#
 
 class Parser(utils.Parser):
-    # 按需要改 dataset，默认给你 walker2d
+    # 默认 walker2d，你可以改成 halfcheetah-medium-expert-v2 等
     dataset: str = 'walker2d-medium-replay-v2'
     config: str = 'config.locomotion'
 
@@ -42,9 +42,9 @@ def restore_env_state(env, state):
 
     qpos = state[:nq]
     qvel = state[nq:]
-
     base_env.set_state(qpos, qvel)
 
+    # 把外层 wrapper 的 step 计数也重置
     e = env
     while True:
         if hasattr(e, "_elapsed_steps"):
@@ -53,6 +53,38 @@ def restore_env_state(env, state):
             e = e.env
         else:
             break
+
+
+def obs_to_state(env, obs, ref_state=None):
+    """
+    将 mujoco-style obs 转为完整 state = [qpos, qvel]
+    假设 obs = [qpos[1:], qvel]（walker2d/halfcheetah 这种结构）。
+    """
+    base_env = unwrap_env(env)
+    model = base_env.model
+    nq = model.nq
+    nv = model.nv
+
+    obs = np.asarray(obs)
+    assert obs.shape[-1] == (nq - 1 + nv), \
+        f"obs dim {obs.shape[-1]} != {nq-1+nv} (nq-1+nv)"
+
+    if ref_state is None:
+        ref_state = base_env.state_vector()
+    ref_state = np.asarray(ref_state)
+    assert ref_state.shape[-1] == nq + nv
+
+    qpos0 = ref_state[:nq]
+    root_x = qpos0[0]
+
+    qpos = np.zeros(nq, dtype=np.float32)
+    qvel = np.zeros(nv, dtype=np.float32)
+
+    qpos[0] = root_x
+    qpos[1:] = obs[:nq-1]
+    qvel[:] = obs[nq-1:]
+
+    return np.concatenate([qpos, qvel], axis=0)
 
 
 # -----------------------------------------------------------------------------#
@@ -107,110 +139,125 @@ init_state = base_env.state_vector().copy()
 print("[Info] Initial obs shape:", obs0.shape)
 print("[Info] diffusion horizon:", diffusion.horizon)
 
-H = diffusion.horizon          # 例如 4
-TARGET_STEPS = 32              # 想要最多跑多少步（两个 rollout 都用这个上限）
+H = diffusion.horizon      # e.g., 4
+T_MAX = 32                 # env 交互最多步数（两条 rollout 都用这个上限）
 
 
 # -----------------------------------------------------------------------------#
-# 1) Rollout A: 每 1 步 replan（标准 MPC：step-wise replan）                    #
+# 1) Rollout plan1: 每 1 步 replan（MPC-style）                                  #
 # -----------------------------------------------------------------------------#
 
 restore_env_state(env, init_state)
 obs = obs0.copy()
 
-states_plan_every_1 = [base_env.state_vector().copy()]
+states_plan1 = [base_env.state_vector().copy()]
 
-for t in range(TARGET_STEPS):
+for t in range(T_MAX):
     if t % 10 == 0:
-        print(f"[Plan-every-1] t={t}", flush=True)
+        print(f"[plan1] t={t}", flush=True)
 
     conditions = {0: obs}
-    # action_1 是第一步 action，samples_1.actions[0] 是整条 plan
-    action_1, samples_1 = policy(conditions, batch_size=1, verbose=False)
+    act_1, samples_1 = policy(conditions, batch_size=1, verbose=False)
 
-    obs, r, done, info = env.step(action_1)
-    states_plan_every_1.append(base_env.state_vector().copy())
+    obs, r, done, info = env.step(act_1)
+    states_plan1.append(base_env.state_vector().copy())
 
     if done:
-        print(f"[Plan-every-1] episode done at t={t}")
+        print(f"[plan1] episode done at t={t}")
         break
 
-states_plan_every_1 = np.stack(states_plan_every_1, axis=0)
-print("[Info] Plan-every-1 rollout length (env steps):",
-      len(states_plan_every_1) - 1)
+states_plan1 = np.stack(states_plan1, axis=0)
+print("[Info] plan1 rollout length (env steps):", len(states_plan1) - 1)
 
 
 # -----------------------------------------------------------------------------#
-# 2) Rollout B: 每 H 步 replan（segment-wise：执行完整 horizon 的 plan）        #
+# 2) Rollout planH: 每 H 步 replan，一次执行完整 horizon 计划                   #
 # -----------------------------------------------------------------------------#
 
 restore_env_state(env, init_state)
 obs = obs0.copy()
 
-states_plan_every_H = [base_env.state_vector().copy()]
+states_planH = [base_env.state_vector().copy()]
 
-current_plan_actions = None   # 当前 segment 的 action 序列 [H, act_dim]
-step_in_segment = 0           # 当前 segment 内第几步
+current_plan_actions = None   # [H, act_dim]
+step_in_segment = 0
 
-for t in range(TARGET_STEPS):
+for t in range(T_MAX):
     if current_plan_actions is None or step_in_segment >= H:
-        # 需要重新 plan 一次：从当前 obs 出发，采样一条长度 H 的 plan
         conditions = {0: obs}
         _, samples_seg = policy(conditions, batch_size=1, verbose=False)
 
         if not hasattr(samples_seg, "actions"):
-            raise RuntimeError(
-                "samples_seg 没有 actions 字段，policy 没有返回整条 action 计划？"
-            )
+            raise RuntimeError("samples_seg 没有 actions 字段？")
 
         current_plan_actions = samples_seg.actions[0]   # [H, act_dim]
         step_in_segment = 0
+        print(f"[planH] new plan at t={t}")
 
-        print(f"[Plan-every-H] new plan at t={t}, will execute up to {H} steps")
-
-    # 执行当前 plan 内的第 step_in_segment 个 action
     a = current_plan_actions[step_in_segment]
     obs, r, done, info = env.step(a)
-    states_plan_every_H.append(base_env.state_vector().copy())
+    states_planH.append(base_env.state_vector().copy())
     step_in_segment += 1
 
     if done:
-        print(f"[Plan-every-H] episode done at t={t}")
+        print(f"[planH] episode done at t={t}")
         break
 
-states_plan_every_H = np.stack(states_plan_every_H, axis=0)
-print("[Info] Plan-every-H rollout length (env steps):",
-      len(states_plan_every_H) - 1)
+states_planH = np.stack(states_planH, axis=0)
+print("[Info] planH rollout length (env steps):", len(states_planH) - 1)
+
+
+# -----------------------------------------------------------------------------#
+# 3) Direct plan: 纯 diffusion 预测 obs（open-loop），不与 env 交互               #
+# -----------------------------------------------------------------------------#
+
+print("\n[direct] sampling open-loop plan from initial obs...")
+conditions0 = {0: obs0}
+_, samples0 = policy(conditions0, batch_size=1, verbose=False)
+
+if not hasattr(samples0, "observations"):
+    raise RuntimeError("samples0 没有 observations 字段？")
+
+plan_obs = samples0.observations[0]   # [H, obs_dim]
+print("[Info] direct-plan predicted obs shape:", plan_obs.shape)
+
+direct_states = []
+for i in range(len(plan_obs)):
+    st = obs_to_state(env, plan_obs[i], ref_state=init_state)
+    direct_states.append(st)
+direct_states = np.stack(direct_states, axis=0)
+print("[Info] direct-plan state length:", len(direct_states))
 
 
 # -----------------------------------------------------------------------------#
 #                             Rendering to images                               #
 # -----------------------------------------------------------------------------#
 
-# 保存路径自动推一推
+# 保存目录：短一点，就叫 traj_vis
 if args.savepath is None:
     base_save = os.path.join(args.loadbase, args.dataset)
     if args.diffusion_loadpath is not None:
         base_save = os.path.join(base_save, args.diffusion_loadpath)
-    save_root = os.path.join(base_save,
-                             f"two_rollout_images_plan1_vs_planH_T{TARGET_STEPS}")
+    save_root = os.path.join(base_save, "traj_vis")
 else:
-    save_root = os.path.join(args.savepath,
-                             f"two_rollout_images_plan1_vs_planH_T{TARGET_STEPS}")
+    save_root = os.path.join(args.savepath, "traj_vis")
 
-dir_every_1 = os.path.join(save_root, "plan_every_1")
-dir_every_H = os.path.join(save_root, "plan_every_H")
-os.makedirs(dir_every_1, exist_ok=True)
-os.makedirs(dir_every_H, exist_ok=True)
+dir_plan1 = os.path.join(save_root, "plan1")
+dir_planH = os.path.join(save_root, "planH")
+dir_direct = os.path.join(save_root, "direct")
 
-print(f"[Saving] Plan-every-1 images -> {dir_every_1}")
-print(f"[Saving] Plan-every-H images -> {dir_every_H}")
+os.makedirs(dir_plan1, exist_ok=True)
+os.makedirs(dir_planH, exist_ok=True)
+os.makedirs(dir_direct, exist_ok=True)
+
+print(f"[Saving] plan1  -> {dir_plan1}")
+print(f"[Saving] planH  -> {dir_planH}")
+print(f"[Saving] direct -> {dir_direct}")
 
 
 def render_state_sequence(states, out_dir, prefix):
     """
-    给定一串 MUJOCO state（qpos+qvel），逐帧用 renderer.render() 存成 png.
-    states: [N, nq+nv]，包含 t=0 的初始 state。
+    states: [N, nq+nv] 或 [N, ...]，逐帧渲成 png.
     """
     for i, st in enumerate(states):
         img = renderer.render(st)
@@ -218,8 +265,9 @@ def render_state_sequence(states, out_dir, prefix):
         imageio.imwrite(fname, img)
 
 
-render_state_sequence(states_plan_every_1, dir_every_1, prefix="plan1")
-render_state_sequence(states_plan_every_H, dir_every_H, prefix="planH")
+render_state_sequence(states_plan1, dir_plan1, prefix="p1")
+render_state_sequence(states_planH, dir_planH, prefix="pH")
+render_state_sequence(direct_states, dir_direct, prefix="pd")
 
 print("[Done] All frames saved.")
 
