@@ -11,10 +11,9 @@ import diffuser.utils as utils
 # -----------------------------------------------------------------------------#
 
 class Parser(utils.Parser):
-    # 默认你可以改成别的，比如 'halfcheetah-medium-expert-v2'
+    # 按需要改 dataset，默认给你 walker2d
     dataset: str = 'walker2d-medium-replay-v2'
     config: str = 'config.locomotion'
-
 
 args = Parser().parse_args('plan')
 
@@ -46,7 +45,6 @@ def restore_env_state(env, state):
 
     base_env.set_state(qpos, qvel)
 
-    # 把外面 TimeLimit 等 wrapper 的步骤计数也重置一下
     e = env
     while True:
         if hasattr(e, "_elapsed_steps"):
@@ -109,111 +107,119 @@ init_state = base_env.state_vector().copy()
 print("[Info] Initial obs shape:", obs0.shape)
 print("[Info] diffusion horizon:", diffusion.horizon)
 
-horizon = diffusion.horizon
-TARGET_STEPS = 32   # 你想对齐到的步数
+H = diffusion.horizon          # 例如 4
+TARGET_STEPS = 32              # 想要最多跑多少步（两个 rollout 都用这个上限）
 
 
 # -----------------------------------------------------------------------------#
-# 1) Fixed-plan rollout: 执行第一次 plan 的整条 action，并补到 TARGET_STEPS 步  #
-# -----------------------------------------------------------------------------#
-
-# 从初始 obs0 sample 一条 plan
-conditions0 = {0: obs0}
-action0, samples0 = policy(conditions0, batch_size=1, verbose=args.verbose)
-
-if not hasattr(samples0, "actions"):
-    raise RuntimeError("samples0 没有 actions 字段，policy 没有返回整条 action 计划？")
-
-plan_actions = samples0.actions[0]   # shape: [H, act_dim]
-plan_len = plan_actions.shape[0]
-print("[Info] Got fixed plan actions with shape:", plan_actions.shape)
-
-# 确保从 init_state 开始
-restore_env_state(env, init_state)
-obs = obs0.copy()
-
-fixed_states = [base_env.state_vector().copy()]
-
-for t in range(TARGET_STEPS):
-    if t < plan_len:
-        a = plan_actions[t]
-    else:
-        # 计划长度不够 TARGET_STEPS 的时候，继续使用最后一个 plan action
-        a = plan_actions[-1]
-
-    obs, r, done, info = env.step(a)
-    fixed_states.append(base_env.state_vector().copy())
-
-    if done:
-        print(f"[Fixed-plan] episode done at t={t}")
-        break
-
-fixed_states = np.stack(fixed_states, axis=0)
-print("[Info] Fixed-plan rollout length:", len(fixed_states))
-
-
-# -----------------------------------------------------------------------------#
-# 2) Replan rollout: 每一步都重新 plan，只执行第一步 action，最多 TARGET_STEPS 步#
+# 1) Rollout A: 每 1 步 replan（标准 MPC：step-wise replan）                    #
 # -----------------------------------------------------------------------------#
 
 restore_env_state(env, init_state)
 obs = obs0.copy()
 
-replan_states = [base_env.state_vector().copy()]
+states_plan_every_1 = [base_env.state_vector().copy()]
 
 for t in range(TARGET_STEPS):
     if t % 10 == 0:
-        print(f"[Replan] t={t}", flush=True)
+        print(f"[Plan-every-1] t={t}", flush=True)
 
     conditions = {0: obs}
-    action_t, samples_t = policy(conditions, batch_size=1, verbose=False)
+    # action_1 是第一步 action，samples_1.actions[0] 是整条 plan
+    action_1, samples_1 = policy(conditions, batch_size=1, verbose=False)
 
-    obs, r, done, info = env.step(action_t)
-    replan_states.append(base_env.state_vector().copy())
+    obs, r, done, info = env.step(action_1)
+    states_plan_every_1.append(base_env.state_vector().copy())
 
     if done:
-        print(f"[Replan] episode done at t={t}")
+        print(f"[Plan-every-1] episode done at t={t}")
         break
 
-replan_states = np.stack(replan_states, axis=0)
-print("[Info] Replan rollout length:", len(replan_states))
+states_plan_every_1 = np.stack(states_plan_every_1, axis=0)
+print("[Info] Plan-every-1 rollout length (env steps):",
+      len(states_plan_every_1) - 1)
+
+
+# -----------------------------------------------------------------------------#
+# 2) Rollout B: 每 H 步 replan（segment-wise：执行完整 horizon 的 plan）        #
+# -----------------------------------------------------------------------------#
+
+restore_env_state(env, init_state)
+obs = obs0.copy()
+
+states_plan_every_H = [base_env.state_vector().copy()]
+
+current_plan_actions = None   # 当前 segment 的 action 序列 [H, act_dim]
+step_in_segment = 0           # 当前 segment 内第几步
+
+for t in range(TARGET_STEPS):
+    if current_plan_actions is None or step_in_segment >= H:
+        # 需要重新 plan 一次：从当前 obs 出发，采样一条长度 H 的 plan
+        conditions = {0: obs}
+        _, samples_seg = policy(conditions, batch_size=1, verbose=False)
+
+        if not hasattr(samples_seg, "actions"):
+            raise RuntimeError(
+                "samples_seg 没有 actions 字段，policy 没有返回整条 action 计划？"
+            )
+
+        current_plan_actions = samples_seg.actions[0]   # [H, act_dim]
+        step_in_segment = 0
+
+        print(f"[Plan-every-H] new plan at t={t}, will execute up to {H} steps")
+
+    # 执行当前 plan 内的第 step_in_segment 个 action
+    a = current_plan_actions[step_in_segment]
+    obs, r, done, info = env.step(a)
+    states_plan_every_H.append(base_env.state_vector().copy())
+    step_in_segment += 1
+
+    if done:
+        print(f"[Plan-every-H] episode done at t={t}")
+        break
+
+states_plan_every_H = np.stack(states_plan_every_H, axis=0)
+print("[Info] Plan-every-H rollout length (env steps):",
+      len(states_plan_every_H) - 1)
 
 
 # -----------------------------------------------------------------------------#
 #                             Rendering to images                               #
 # -----------------------------------------------------------------------------#
 
-# 自动决定一个保存根目录：
-# 如果用户给了 --savepath，就用它；否则按 logs/<dataset>/<loadpath>/two_rollout_images
+# 保存路径自动推一推
 if args.savepath is None:
     base_save = os.path.join(args.loadbase, args.dataset)
     if args.diffusion_loadpath is not None:
         base_save = os.path.join(base_save, args.diffusion_loadpath)
-    save_root = os.path.join(base_save, "two_rollout_images_32")
+    save_root = os.path.join(base_save,
+                             f"two_rollout_images_plan1_vs_planH_T{TARGET_STEPS}")
 else:
-    save_root = os.path.join(args.savepath, "two_rollout_images_32")
+    save_root = os.path.join(args.savepath,
+                             f"two_rollout_images_plan1_vs_planH_T{TARGET_STEPS}")
 
-fixed_dir = os.path.join(save_root, "fixed_plan")
-replan_dir = os.path.join(save_root, "replan")
-os.makedirs(fixed_dir, exist_ok=True)
-os.makedirs(replan_dir, exist_ok=True)
+dir_every_1 = os.path.join(save_root, "plan_every_1")
+dir_every_H = os.path.join(save_root, "plan_every_H")
+os.makedirs(dir_every_1, exist_ok=True)
+os.makedirs(dir_every_H, exist_ok=True)
 
-print(f"[Saving] Fixed-plan images -> {fixed_dir}")
-print(f"[Saving] Replan images     -> {replan_dir}")
+print(f"[Saving] Plan-every-1 images -> {dir_every_1}")
+print(f"[Saving] Plan-every-H images -> {dir_every_H}")
 
 
 def render_state_sequence(states, out_dir, prefix):
     """
     给定一串 MUJOCO state（qpos+qvel），逐帧用 renderer.render() 存成 png.
+    states: [N, nq+nv]，包含 t=0 的初始 state。
     """
     for i, st in enumerate(states):
-        img = renderer.render(st)   # 这里传的是完整 state，不是 obs
+        img = renderer.render(st)
         fname = os.path.join(out_dir, f"{prefix}_{i:04d}.png")
         imageio.imwrite(fname, img)
 
 
-render_state_sequence(fixed_states, fixed_dir, prefix="fixed")
-render_state_sequence(replan_states, replan_dir, prefix="replan")
+render_state_sequence(states_plan_every_1, dir_every_1, prefix="plan1")
+render_state_sequence(states_plan_every_H, dir_every_H, prefix="planH")
 
 print("[Done] All frames saved.")
 
