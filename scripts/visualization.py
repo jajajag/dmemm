@@ -11,8 +11,10 @@ import diffuser.utils as utils
 # -----------------------------------------------------------------------------#
 
 class Parser(utils.Parser):
-    dataset: str = 'halfcheetah-medium-expert-v2'   # 按需改
+    # 默认你可以改成别的，比如 'halfcheetah-medium-expert-v2'
+    dataset: str = 'walker2d-medium-replay-v2'
     config: str = 'config.locomotion'
+
 
 args = Parser().parse_args('plan')
 
@@ -108,10 +110,11 @@ print("[Info] Initial obs shape:", obs0.shape)
 print("[Info] diffusion horizon:", diffusion.horizon)
 
 horizon = diffusion.horizon
+TARGET_STEPS = 32   # 你想对齐到的步数
 
 
 # -----------------------------------------------------------------------------#
-#                  1) Fixed-plan rollout: 执行第一次 plan 的整条 action         #
+# 1) Fixed-plan rollout: 执行第一次 plan 的整条 action，并补到 TARGET_STEPS 步  #
 # -----------------------------------------------------------------------------#
 
 # 从初始 obs0 sample 一条 plan
@@ -122,6 +125,7 @@ if not hasattr(samples0, "actions"):
     raise RuntimeError("samples0 没有 actions 字段，policy 没有返回整条 action 计划？")
 
 plan_actions = samples0.actions[0]   # shape: [H, act_dim]
+plan_len = plan_actions.shape[0]
 print("[Info] Got fixed plan actions with shape:", plan_actions.shape)
 
 # 确保从 init_state 开始
@@ -130,8 +134,13 @@ obs = obs0.copy()
 
 fixed_states = [base_env.state_vector().copy()]
 
-for t in range(horizon):
-    a = plan_actions[t]
+for t in range(TARGET_STEPS):
+    if t < plan_len:
+        a = plan_actions[t]
+    else:
+        # 计划长度不够 TARGET_STEPS 的时候，继续使用最后一个 plan action
+        a = plan_actions[-1]
+
     obs, r, done, info = env.step(a)
     fixed_states.append(base_env.state_vector().copy())
 
@@ -144,7 +153,7 @@ print("[Info] Fixed-plan rollout length:", len(fixed_states))
 
 
 # -----------------------------------------------------------------------------#
-#              2) Replan rollout: 每一步都重新 plan，只执行第一步 action       #
+# 2) Replan rollout: 每一步都重新 plan，只执行第一步 action，最多 TARGET_STEPS 步#
 # -----------------------------------------------------------------------------#
 
 restore_env_state(env, init_state)
@@ -152,9 +161,7 @@ obs = obs0.copy()
 
 replan_states = [base_env.state_vector().copy()]
 
-max_steps = horizon  # 为了公平起见也跑 horizon 步，你也可以单独设一个更大的 T
-
-for t in range(max_steps):
+for t in range(TARGET_STEPS):
     if t % 10 == 0:
         print(f"[Replan] t={t}", flush=True)
 
@@ -176,10 +183,15 @@ print("[Info] Replan rollout length:", len(replan_states))
 #                             Rendering to images                               #
 # -----------------------------------------------------------------------------#
 
+# 自动决定一个保存根目录：
+# 如果用户给了 --savepath，就用它；否则按 logs/<dataset>/<loadpath>/two_rollout_images
 if args.savepath is None:
-    save_root = os.path.join(args.loadbase, args.dataset, "two_rollout_images")
+    base_save = os.path.join(args.loadbase, args.dataset)
+    if args.diffusion_loadpath is not None:
+        base_save = os.path.join(base_save, args.diffusion_loadpath)
+    save_root = os.path.join(base_save, "two_rollout_images_32")
 else:
-    save_root = os.path.join(args.savepath, "two_rollout_images")
+    save_root = os.path.join(args.savepath, "two_rollout_images_32")
 
 fixed_dir = os.path.join(save_root, "fixed_plan")
 replan_dir = os.path.join(save_root, "replan")
